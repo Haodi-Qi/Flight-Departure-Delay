@@ -10,6 +10,9 @@ Instead of the analyzing every airline, we zoomed in to Southwest Airlines (WN) 
 
 The focus is on departure delay because we discovered the high correlation (~0.94) between departure delay and arrival delay, and therefore reducing departure delay can effectively reduce arrival delay. Moreover, given a new flight, we do not have the data on the actual day of flight, such as duration of taxing in and out. Departure delay is also more likely to cause greater customer unsatisfaction since they have to wait in the longue or the plane.
 
+## Data
+The dataset is from Kaggle <a href='https://www.kaggle.com/usdot/flight-delays'>2015 Flight Delays and Cancellations<a>. Due to some inconsistencies in the airport columns, we mapped the Airport ID to the IATA format based on the data from IATA websites.
+
 ## Analysis and Techniques
 We conducted Descriptive and Predictive analysis on the dataset for the project. 
 
