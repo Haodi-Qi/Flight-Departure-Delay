@@ -1,0 +1,596 @@
+---
+title: "Analysis on U.S. Flight Delays"
+author: "G1 Group 6"
+geometry: margin=1in
+fontsize: 11pt
+output:
+  pdf_document:
+    number_sections: TRUE
+    df_print: kable
+    fig_caption: true
+    toc: true
+---
+\newpage
+# Introduction
+As of 2015, the U.S. Domestic Aviation Industry is worth \$135 billion It is expected to grow to \$150 billion within the next 4 years (IBISWorld, n.d.). With 696.2 million domestic passengers in 2015, the industry witnessed a 5% rise in the number of total passengers from 2014. System-wide demand measured also grew by 5.5% in 2015 (Bureau of Transportation Statistics, 2017). Amongst the competitive industry, American Airlines and Southwest Airlines, emerged with the greatest market shares.
+
+Despite the growth, the airline industry faces high cost pressures due to the high fixed costs alongside the many variable ones. As these expenses are important, airlines look to avoid other such expenditures, specifically those incurred from flight delays. As these expenses are important, airlines look to avoid other such expenditures, specifically those incurred from flight delays. In 2007, flight delays across the U.S. airspace system, defined by the Federal Aviation Administration (FAA) as a flight that departs **more than 15 minutes past its scheduled time**, had cost the U.S. economy \$32.9 billion (CAPA, 2010). Though passengers are estimated to bear more than half of the cost, airlines are estimated to have shouldered \$8.3 billion in costs from flight delays alone in 2007. Therefore, our analysis will focus on creating a model and solution for the market leader in the airline industry to minimize costs related to flight delays.
+
+# Business Use Case and Motivation
+As aforementioned, the airline industry incurs high fixed and variable costs every day. Focusing on the leaders of the domestic industry, we would be analyzing data of Southwest Airlines to understand reasons for departure delays and thereby look to find ways to better pre-empt and manage them.
+ 
+By minimizing delays, airlines could reduce costs for both the business and passengers. The average cost of aircraft block time for U.S. passenger airlines has been estimated to be at \$74.24 per minute (Airlines for America, 2020). Meanwhile, the average value of a passenger’s time is estimated to be \$47 per hour, thereby the economic cost of delay per minute to be $75. 
+ 
+# Dataset
+Our dataset is obtained from "2015 Flight Delays and Cancellations" published by the U.S. Department of Transportation on Kaggle. This dataset contains information of domestic flights of major air carriers in the U.S., including details of on-time, delayed, cancelled and diverted flights.
+
+```{r echo = F, message=F, warning=F}
+packages <- c('corrplot', 'plyr', 'e1071', 'caret', 'rpart', 'rpart.plot', 'ROCR', 'caTools', 'forecast', 'dplyr','igraph', 'reshape2', 'ggplot2', 'scales', 'forcats', 'univOutl', 'RColorBrewer', 'knitr')
+for (p in packages){
+  if(!require(p, character.only = T)){install.packages(p)}
+  library(p,character.only = T) 
+}
+```
+
+# Understanding the Data
+## Data Loading and Preprocessing
+
+Before exploring the data, some general data preprocessing and cleaning is done, including mapping airport ID to IATA formats and imputing missing values. Moreover, as the focus of this project is on flight delays, flights that are cancelled or diverted are removed. Certain features are also converted to factor/character types. We create `DEP_DELAY` and `ARR_DELAY` variables following FAA's definition of flight delays. Irrelevant features such as the year are dropped.
+
+```{r Load Data, echo=F}
+#setwd('../proj/')
+data <- read.csv("data/flights.csv")
+```
+
+```{r Clean IATA, echo=F}
+dfAirportID <- read.csv ("data/L_AIRPORT_ID.csv",colClasses=c("character", "character"), col.names=c("AirportID", "Description"))
+
+dfAirport <- read.csv ("data/L_AIRPORT.csv", colClasses=c("character", "character"), col.names=c("IATA_CODE", "Description"))
+
+Airport_ID_to_IATA <- function(x) {
+  df <- data.frame (ID = as.character (x), stringsAsFactors = FALSE)
+  num_records = nrow (df)
+
+  df <- dplyr::left_join (df, dfAirportID, by=c("ID" = "AirportID"))
+
+  dfAirport <- dfAirport [! (dfAirport$IATA_CODE %in% c('BSM', 'NYL')),]
+  df <- dplyr::left_join (df, dfAirport, by="Description")
+  if (num_records != nrow (df)) {
+    stop ("Due to duplicates in the data, the number of records has changed.")
+  }
+  df$ID <- dplyr::coalesce (df$IATA_CODE, df$ID)
+  return (df$ID)
+}
+```
+
+```{r echo=F}
+# Map Airport ID to IATA Format
+data$ORIGIN_AIRPORT <- Airport_ID_to_IATA(data$ORIGIN_AIRPORT)
+data$DESTINATION_AIRPORT <- Airport_ID_to_IATA(data$DESTINATION_AIRPORT)
+
+# remove Cancelled and Diverted
+data <- subset(data, (data$DIVERTED != 1) & (data$CANCELLED != 1))
+
+# fill in missing value with 0
+cols_with_missing_values = colnames(data)[colSums(is.na(data)) > 0]
+data[c(cols_with_missing_values)]=
+  replace(data[c(cols_with_missing_values)],is.na(data[c(cols_with_missing_values)]),0)
+
+# convert data types
+data[c('MONTH','DAY','DAY_OF_WEEK')] = 
+  sapply(data[c('MONTH','DAY','DAY_OF_WEEK')],as.factor)
+data$FLIGHT_NUMBER <- as.character(data$FLIGHT_NUMBER)
+
+data[c('SCHEDULED_DEPARTURE','SCHEDULED_ARRIVAL','DEPARTURE_TIME')] = 
+  sapply(data[c('SCHEDULED_DEPARTURE','SCHEDULED_ARRIVAL',
+                     'DEPARTURE_TIME')], function(x){x%/% 100+(x%%100)/60})
+
+# create delay variables for departure and arrival
+delay_threshold <- 15
+data$DEP_DELAYED <- as.factor((data$DEPARTURE_DELAY > delay_threshold)*1)
+data$ARR_DELAYED <- as.factor((data$ARRIVAL_DELAY > delay_threshold)*1)
+
+# extract southwest airline data
+southwest <- subset(data, (data$AIRLINE == "WN"))
+southwest$YEAR = southwest$AIRLINE = southwest$WHEELS_OFF <- NULL
+```
+
+## Exploratory Data Analysis (EDA)
+Our EDA process will firstly examine the general airline industry performance as well as compare Southwest's to its competitors where applicable. Subsequently, we explore Southwest's performance in terms of delays and the factors that might contribute to delays.
+
+### Distribution of Flight Volume by Airline 
+
+As Southwest Airlines (WN) has the highest market share in terms of revenue in the U.S. domestic airline industry, we can examine how it compares with its other competitors in terms of flight volume in 2015. The distribution of the Airlines by volume is as follows:
+
+```{r warning=F, echo=F, fig.height=2, fig.width=6, fig.align='center'}
+ggplot(data, aes(x = AIRLINE, color=AIRLINE) ) + 
+        geom_histogram(aes(y = ..count..), stat="count", show.legend = FALSE) +
+    scale_x_discrete(name = "Airlines") + 
+    scale_y_continuous(name = "Number of Flights", labels = scales::comma) +
+    ggtitle('Distribution of Flight Volume by Airline') + 
+    theme(plot.title = element_text(hjust = 0.5,size=10))
+```
+
+From the barplot, we can see that Southwest Airlines indeed has the most number of flights in 2015 and the difference with the next most popular airline, Delta Airlines (DL), is quite significant. **With the highest flight volume in the domestic industry, Southwest has more at stake to ensure satisfactory performance in order to maintain its lead**.
+
+### Top 10 busiest airports
+
+We also would like to see the distribution by airports to identify the top 10 busiest airports.
+
+```{r echo=F}
+# frequency of flights by airport for all flights and for southwest airline flights only
+overall_df <- as.data.frame(table(data$ORIGIN_AIRPORT))
+names(overall_df) <- c('ORIGIN_AIRPORT','Freq')
+```
+
+```{r echo=F, fig.height=3, fig.width=8, fig.align='center'}
+top10_airport_overall <- overall_df[tail(order(overall_df$Freq), 10), ]
+barplot(top10_airport_overall$Freq,xlab='Airport', ylab='Num of flights',
+        main = "Distribution of flight volume by airports", 
+        col=brewer.pal(5, "Set2"),
+        names.arg = top10_airport_overall$ORIGIN_AIRPORT)
+```
+The busiest airport by volume is ATL, Hartsfield–Jackson Atlanta International Airport.
+
+### Departure and Arrival Delays
+
+There are two main categories of delays in the airline industry that affect passengers:departure delay and arrival delay. Below shows the proportion of flights for each type of delay. We have similarly defined a delayed arrival as having arrived more than 15 minutes past its scheduled time. The number of delayed flights in departure and arrival is similar, around 17.8%
+
+```{r echo=F}
+dep_delay_table <- table(data$DEP_DELAYED)
+arr_delay_table <- table(data$ARR_DELAYED)
+cat("Class distribution for departure delay: ", round((dep_delay_table[2]/sum(dep_delay_table))*100,2), "%", "\nClass distribution for arrival delay:", round((arr_delay_table[2]/sum(arr_delay_table))*100,2), "%")
+```
+We hypothesize that there is a strong correlation between departure delay and arrival delay, such that a flight that departs late is likely to arrive late by a similar extent.
+```{r}
+cor(data$ARRIVAL_DELAY, data$DEPARTURE_DELAY)
+```
+The correlation between departure delay and arrival delay is very high at 0.9447, which proves our hypothesis true. This is unsurprising given that **late departure is most likely to lead to late arrival**. As such, our analysis should focus on finding factors that contribute to departure delays.
+
+### Departure Delay Performance of Airlines
+
+We now use `DEPARTURE_DELAY` as a measure to assess how well the airlines perform in terms of delays. We use a boxplot to represent this information, with the overall industry median departure delay as a reference point as to compare each airline to the industry level.
+
+```{r echo=F, message=F, warning=F, fig.height=4, fig.show="hold", out.width="50%"}
+overall_median <- median(data$DEPARTURE_DELAY)
+ggplot(data,aes(x=fct_reorder(AIRLINE,DEPARTURE_DELAY), y=DEPARTURE_DELAY)) + geom_boxplot() + xlab("Airlines") + ylab("Departure Delay (min)") + geom_hline(yintercept=overall_median, linetype="dashed", color = "red") + ggtitle('Boxplot of Departure Delay per Airline') + theme(plot.title = element_text(hjust = 0.5)) + coord_cartesian(ylim = c(-60, 200))
+
+#Remove Outliers
+delayed_flights <- data[which(data$DEPARTURE_DELAY>0),]
+k <- boxB(data$DEPARTURE_DELAY, k=1.5)
+outliers <- k$outliers
+no_outliers <- data[-outliers,]
+
+
+ggplot(data,aes(x=fct_reorder(AIRLINE,DEPARTURE_DELAY), y=DEPARTURE_DELAY))+ geom_boxplot(outlier.colour=NA)+ coord_cartesian(ylim = c(-40,50)) +xlab("Airlines") + ylab("Departure Delay (min)") + ggtitle('Boxplot of Departure Delay per Airline (excl. outliers)') +geom_hline(yintercept=overall_median, linetype="dashed", color = "red")  + theme(plot.title = element_text(hjust = 0.5))
+```
+
+We discovered that there were too many outliers for all airlines to make the boxplot useful in investigating the departure delay of the majority of the flights. As such, we exclude the outliers in our boxplot. After hiding the outliers, we have a better view of the distribution of departure delays for each airline. Compared to the overall median departure delay (red dashed line), we observe that 9/14 airlines have a median departure delay below or almost equal to the overall median departure delay, showing that most airlines performances are similar to the industry average.
+
+However, for Southwest airlines, its median delay is above the industry median. As an industry leader, we believe Southwest Airlines should aim to improve its departure on-time performance to maintain its lead as as well as to protect its reputation in the eyes of passengers and ensure that their passengers remain satisfied with their service. 
+
+We chart our course in trying to find additional factors that might contribute to departure delays. 
+
+### Impact of Seasonality on Departure Delay
+
+We now want to explore if the month of the flight would affect departure delay likelihood. This is done by comparing the average departure delay to the monthly average departure delay. We found that **the peak holidays season (i.e. December, January, February, June, July) usually affects the departure delay**. These are the winter break as well as the summer break periods. However, the mean values are not significantly large such that it goes beyond the FAA’s definition of 15 minutes. (Note: dashed lines represent the industry average across the year)
+
+```{r echo=F, fig.height=4, fig.show="hold", out.width="50%"}
+#Overall Dataset
+month_info <- unique(data$MONTH)
+dep_del_mean <- as.data.frame(tapply(data$DEPARTURE_DELAY, as.numeric(data$MONTH), mean))
+dep_del_mean <- cbind(month_info, dep_del_mean)
+names(dep_del_mean)[1] <- 'MONTH'
+names(dep_del_mean)[2] <- 'DEP_MEAN_DELAY'
+dep_del_mean$MONTH <- as.factor(dep_del_mean$MONTH)
+
+mean_delay <- mean(data$DEPARTURE_DELAY)
+ggplot(dep_del_mean,aes(x=fct_reorder(MONTH,DEP_MEAN_DELAY), y=DEP_MEAN_DELAY))+ geom_boxplot()+ xlab("MONTH") + ylab("Mean Departure Delay (min)")  + ggtitle('Industry Mean Departure Delay per Month') +geom_hline(yintercept=mean_delay, linetype="dashed", color = "red") + coord_cartesian(ylim = c(5, 16)) + theme(plot.title = element_text(hjust = 0.5))
+
+#Southwest Only
+month_info <- unique(southwest$MONTH)
+dep_del_mean <- as.data.frame(tapply(southwest$DEPARTURE_DELAY, as.numeric(southwest$MONTH), mean))
+dep_del_mean <- cbind(month_info, dep_del_mean)
+names(dep_del_mean)[1] <- 'MONTH'
+names(dep_del_mean)[2] <- 'DEP_MEAN_DELAY'
+dep_del_mean$MONTH <- as.factor(dep_del_mean$MONTH)
+
+ggplot(dep_del_mean,aes(x=fct_reorder(MONTH,DEP_MEAN_DELAY), y=DEP_MEAN_DELAY))+ geom_boxplot()+ xlab("MONTH") + ylab("Mean Departure Delay (min)")  + ggtitle('Southwest Mean Departure Delay per Month') +geom_hline(yintercept=mean_delay, linetype="dashed", color = "blue") + coord_cartesian(ylim = c(5, 16)) + theme(plot.title = element_text(hjust = 0.5))
+```
+
+Additionally, by comparing Southwest's performance with the industry averages, we can see that in the months of 4, 9, 10, and 11 where average delay is below the yearly industrial average, Southwest on average experiences slightly higher departure delays. In the higher ranges, we see that Southwest also experiences higher-than-industry average departure delays, with the difference more pronounced in the months of 6 and 7.
+
+### Relationship Between Busy Airports and Delays
+
+```{r warning=F, echo=F, fig.height=2, fig.width=5, fig.align='center'}
+southwest_df = as.data.frame(table(southwest$ORIGIN_AIRPORT))
+names(southwest_df)= c('ORIGIN_AIRPORT','Freq')
+
+dep_southwest = aggregate(DEPARTURE_DELAY ~ ORIGIN_AIRPORT, southwest, mean)
+
+southwest_df = cbind(southwest_df, dep_southwest)
+southwest_df[3] <- NULL
+
+ggplot(southwest_df, aes(x = log(Freq), y = DEPARTURE_DELAY) ) + geom_point() + stat_smooth(method = "lm") + xlab("Log(Number of Flights from the Airport)") + ylab("Mean Departure Delay")
+```
+
+```{r}
+cor(southwest_df$DEPARTURE_DELAY, southwest_df$Freq)
+```
+We now focus on other factors that might contribute to Southwest's delay performance being worse than industrial average. Initially, we had a hypothesis that flying from busy airports would lead to higher likelihood of delays. Focusing on Southwest's records only, we tried to correlate whether the volume of flights at the `ORIGIN_AIRPORT` would affect the `DEPARTURE_DELAY`. Our hypothesis was supported by the correlation that we got, 0.6049, and could be explained where **busier airports tend to have to manage more flight and air traffic within limited number of runways**.
+
+### Summary of Key EDA Findings
+
+In summary, we compared Southwest's departure delay performance to others in the industry and found that **the company is actually performing slightly worse than the industry averages**, across the year as well as within each month, even while being the industry leader in market share and flight volumes. By narrowing our focus onto departure delays, we also found that the month of the flight and the popularity of the airport where the flight is departing from are likely contributors to delays in departure.
+
+# Predictive Analysis on Flight Departure Delay
+
+To assist Southwest Airlines in management of flight delays, we can predict the exact number of minutes of departure delay with regression or whether a flight will be delayed with classification. We believe that when a flight is delayed, the exact number of minutes may not be crucial; e.g. a flight delayed for 30 minutes is not much different from another delayed for 40 minutes. We explored Multi-linear Regression; the R-square value is only slightly over 0.2 with a root mean square error of over 23 minutes. The linear regression model did not perform well. As such, we proceed this problem as a binary classification problem. 
+
+## Predictive Analysis Data Preprocessing
+
+As there will be some features calculations based on route and origin airport information (refer to Section 5.1.2), a few outliers were excluded where the frequency of a route did not meet our minimum criteria of 1 flight per month (i.e. 12 flights in a year). This is so that the calculated values (e.g. estimates of on-time performance) can be more accurate and reflect more points of data.
+
+```{r echo=F}
+southwest$trips= paste(southwest$ORIGIN_AIRPORT, southwest$DESTINATION_AIRPORT, sep='-')
+trip_freq = data.frame(table(southwest$trips)) 
+infreq_trips = subset(trip_freq, trip_freq$Freq<12)$Var1
+southwest  = subset(southwest, !(southwest$trips %in% infreq_trips))
+southwest$trips = southwest$ARR_DELAYED = NULL
+```
+
+```{r echo=F}
+# keep as a backup and remove data variable to save RAM
+backup = southwest
+rm(data)
+```
+
+
+### Data splitting into train, validation and test sets
+
+To have a fair evaluation of different models’ performances later, we split the dataset into *train*, *validation* and *test* sets with a ratio of 60-20-20. The training set will be used to explore features and train models; the validation set will be used for hyperparameter tuning and final model selection; and the test set will only be used for the final model evaluation. 
+
+The final best model will be trained with the combination of the training and validation sets.
+
+```{r echo=F}
+set.seed(100)
+train_test_split = sample.split(southwest$DEP_DELAYED, SplitRatio = 0.80)
+train_valid <- subset(southwest, train_test_split == T)
+set.seed(100)
+train_valid_split = sample.split(train_valid$DEP_DELAYED, SplitRatio = 0.75)
+train <- subset(train_valid, train_valid_split == T)
+valid <- subset(train_valid, train_valid_split == F)
+```
+
+### Feature Engineering
+
+In addition to the preprocessing steps described in Section 4, more processing was required to prepare the dataset for model training. These include some feature selection and engineering which are explained below. As the ultimate purpose of the model is to predict departure delay on unseen data, the new features engineered will only be from the train set for feature and model selection, and the combination of the train and validation sets for final model training. 
+
+For feature selection, given that our model seeks to predict the possible *departure delay* of a new flight, we will not be able to use information related to the actual flight in or around the time of the actual departure, such as the duration of taxi-in, taxi-out and the actual flight. Therefore, we will only use the **scheduled information** that are known before the day of the flight, including origin and destination airports.
+
+Given that feature selection now leaves us with a few variables such as date of flight and origin/departure airports, the team engineered new features for the prediction models. Inspired by the positive positive correlation between the frequency of flights from an airport and the mean delay of the airport, we use the train set to come up with quantiles to group airports based on their frequency as origins. `origin_qtile` indicates which quantile, out of 10 quantiles, the origin of a flight is in, with `origin_qtile = 10` indicating that the flight’s origin airport is in the 90-100th percentile in terms of origin airport frequency. Below shows the origin quantile of 3 airports.  
+
+```{r echo=FALSE}
+get_airport_qtiles = function(df){
+  origin_airport_table <- table(df$ORIGIN_AIRPORT)
+  airport_freq <- as.data.frame(origin_airport_table)
+  colnames(airport_freq) <- c('airport', "origin_freq")
+  origin_qtiles <- quantile(table(df$ORIGIN_AIRPORT), probs=seq(0,1,0.1))
+  airport_freq$origin_qtile <- seq(1,1,length.out = nrow(airport_freq))
+  for (i in seq(2,10,1)){
+    airport_freq$origin_qtile[airport_freq$origin_freq > origin_qtiles[[i]] & airport_freq$origin_freq <= origin_qtiles[[i+1]]] <- i}
+  airport_freq$origin_freq = airport_freq$dest_freq <- NULL
+  return(airport_freq)
+}
+
+# get trip frequency quantiles by origin airport 
+airport_qtiles = get_airport_qtiles(train) 
+southwest = left_join(southwest, airport_qtiles, 
+                      by=c('ORIGIN_AIRPORT'='airport'))
+```
+
+```{r echo=F}
+head(airport_qtiles,3)
+```
+Next, we conduct feature extraction for on-time performance of a flight. We define the measure of on-time performance to be the proportion of flights that were delayed (more than 15 minutes) out of all known completed flights in the data. The `flight_num` and `tail_num` features can be used to aggregate the mean proportion of delayed flights in the train set. The new features, `plane_otp` and `flightnum_otp`, could be interpreted as the proportion of delayed flights per individual aircraft and flight number respectively. Any missing values due to the random split not capturing specific flight/tail numbers are imputed with the average on-time performance on the train set.
+
+Below shows the on-time performance of 3 aircrafts respectively.
+
+```{r echo=F}
+get_plane_otp = function(df){
+  plane_otp <- as.data.frame(tapply(df$DEPARTURE_DELAY > delay_threshold, df$TAIL_NUMBER, mean))
+  plane_otp <- cbind(TAIL_NUMBER = rownames(plane_otp), plane_otp)
+  rownames(plane_otp) <- 1:nrow(plane_otp)
+  colnames(plane_otp) <- c("TAIL_NUMBER", "plane_otp")
+  return (plane_otp)}
+
+get_flight_otp = function(df){
+  flightnum_otp <- as.data.frame(tapply(df$DEPARTURE_DELAY > delay_threshold, df$FLIGHT_NUMBER, mean))
+  flightnum_otp <- cbind(FLIGHT_NUMBER = rownames(flightnum_otp), flightnum_otp)
+  rownames(flightnum_otp) <- 1:nrow(flightnum_otp)
+  colnames(flightnum_otp) <- c("FLIGHT_NUMBER", "flightnum_otp")
+  return (flightnum_otp)
+}
+
+# plane_otp
+plane_otp = get_plane_otp(train)
+southwest <- left_join(southwest, plane_otp, by="TAIL_NUMBER")
+
+# flight_otp
+flight_otp = get_flight_otp(train)
+southwest <- left_join(southwest, flight_otp, by="FLIGHT_NUMBER")
+
+# as some flights are not present in the train set, we use the overall mean otp 
+# to impute 
+southwest[is.na(southwest$flightnum_otp),]$flightnum_otp = 
+  mean(southwest$flightnum_otp,na.rm = TRUE)
+
+head(plane_otp,3)
+```
+Furthermore, we believe that the characteristics of the origin and destination airport may affect how the airlines are scheduled to depart and arrive. The EDA in Section 4 shows the popularity of an airport is correlated with delay times. Knowing that all the flights actually form a weighted network where airports are nodes, flights are edges and weights are frequency of routes, we can use the various node centrality measures to capture the different characteristics of airports.  The specific node centrality measures used are:
+
+  1. Indegree: the number of incoming flights arriving at this airport
+  2. Outdegree: the number of flights departing from this airport
+  3. Betweenness: the degree of brokerage of an airport in this network
+  4. Closeness: the closeness of the airport to all other airports
+
+Below shows the graph features of 3 airports.
+```{r echo=F}
+get_graph_features = function(df){
+  flight_org_dest = data.frame(origin = df$ORIGIN_AIRPORT, to=df$DESTINATION_AIRPORT)
+  g <- graph_from_data_frame(flight_org_dest, directed=TRUE)
+  graph_df = data.frame(get.vertex.attribute(g))
+  graph_df$outdegree = degree(g, mode='out',normalized=TRUE)
+  graph_df$indegree =degree(g, mode='in',normalized=TRUE)
+  graph_df$betweenness =betweenness(g,normalized=TRUE)
+  graph_df$closeness =closeness(g, normalized=TRUE)
+  names(graph_df) = c("ORIGIN_AIRPORT", names(graph_df)[2:5])
+  return (graph_df)}
+merge_graph_features = function(graph_df, df){
+  df = left_join (df, graph_df, by="ORIGIN_AIRPORT")
+  names(df)[33:36] = lapply(names(df)[33:36],function(x) paste('origin',x,sep='_'))
+  return (df)}
+
+graph_df = get_graph_features(train)
+southwest = merge_graph_features(graph_df, southwest)
+head(graph_df,3)
+```
+As our dataset contains features that specifies causes of delays, such as the ```WEATHER_DELAY``` and ```AIR_SYSTEM_DELAY```. We aggregate the ```WEATHER_DELAY``` by month and origin airports as the weather conditions in different time periods and locations are different. ```AIR_SYSTEM_DELAY``` is aggregated by origin airports as we are concerned about departure. ```AIRLINE_DELAY``` is irrelevant as we only focus on the Southwest Airlines only; ```LATE_AIRCRAFT_DELAY``` is taken into account by the ```PLANE_OTP``` variable. Below shows the mean weather delay of an airport in 3 different months in 3 different airports.
+```{r echo=F}
+get_mean_delay = function(df,cols,delay_col){
+  delay_df = df[append(cols,delay_col)]
+  delay_df[delay_col] = sapply(delay_df[,length(delay_df)],function(x){if(is.na(x)){return(0)}else{return(x)}})
+  col_list = list()
+  for (i in seq(1,length(cols),1)){col_list = append(col_list, list(as.vector(delay_df[[cols[i]]])))}
+  delay_df_mean = aggregate(delay_df[delay_col], col_list, mean)
+  names(delay_df_mean) = append(cols, paste('MEAN',delay_col,sep='_'))
+  return(delay_df_mean)
+}
+
+month_origin_weather_delay_mean = 
+  get_mean_delay(train, c('MONTH','ORIGIN_AIRPORT'),'WEATHER_DELAY')
+
+southwest = left_join (southwest, month_origin_weather_delay_mean, 
+                       by=c('MONTH','ORIGIN_AIRPORT'))
+origin_system_delay_mean = 
+  get_mean_delay(train, c('ORIGIN_AIRPORT'),'AIR_SYSTEM_DELAY')
+southwest = 
+  left_join (southwest, origin_system_delay_mean, by=c('ORIGIN_AIRPORT'))
+
+head(month_origin_weather_delay_mean,3)
+```
+
+Besides the aforementioned features, there are some features that we explore but do not work well for the logistic regression. As people are more likely to travel during holidays and thus we include the U.S. public holidays in 2015 as a feature; however the feature does not improve our performance and we believe it is because the ```MONTH``` feature actually captures the holiday effect, both public and school holidays. The ```is_weekend``` feature does not contribute much as well. The ```SECURITY_DELAY```, which is generated by aggregation of ```SECURITY_DELAY``` by origin airports, only improves the performance minimally due to a nearly 0 correlation with the ```DEPARTURE_DELAY``` variable. 
+```{r echo=F}
+# is_holiday
+holidays <- c('1-1', '1-19','5-25', '7-3', '9-7', '11-11', '11-26', '12-25')
+flight_date <- paste(southwest$MONTH,southwest$DAY, sep='-')
+southwest$IS_HOLIDAY = as.factor((flight_date %in% holidays)*1)
+# is_weekend
+southwest$is_weekend =  as.factor(sapply(southwest$DAY_OF_WEEK, function(x)
+  {return((x==6)|(x==7))}))
+# mean_security_delay
+origin_security_delay_mean = get_mean_delay(
+  train, c('ORIGIN_AIRPORT'),'SECURITY_DELAY')
+southwest = left_join (southwest, origin_security_delay_mean,
+                       by=c('ORIGIN_AIRPORT'))
+```
+
+## Evaluation Metrics
+
+The evaluation metrics we employ are Precision, Recall, F1-Score and Area under Recipient Operating Curve (AUC), with AUC being the main criteria for model selection.
+
+## Model Exploration
+
+As regression models and tree-based models use different approaches in drawing the decision boundary, we believe that we should explore models under both types and select the better one. The two classification models we select to explore are Logistic Regression and Classification Tree.  
+
+Due to limited computational resources and the large number of observations in our dataset, we discover that a Random Forest model needs hours to train, even with fewer than 100 trees. Thus, we do not explore ensemble models.
+
+```{r echo=F}
+use_col = c('MONTH', 'DAY', 'SCHEDULED_DEPARTURE', 'SCHEDULED_ARRIVAL', 'DAY_OF_WEEK',
+            'SCHEDULED_TIME' , 'DISTANCE' , 'DEP_DELAYED', 'plane_otp' , 'flightnum_otp' ,
+            'origin_outdegree' , 'origin_indegree' , 'origin_betweenness', 'origin_closeness', 
+            'origin_qtile', 'MEAN_AIR_SYSTEM_DELAY', 'MEAN_WEATHER_DELAY', 
+            # features below are not used in log reg 
+            'is_weekend', 'MEAN_SECURITY_DELAY','IS_HOLIDAY')
+```
+
+```{r echo=F}
+train_valid <- subset(southwest, train_test_split == T)
+train <- subset(train_valid, train_valid_split == T)
+valid <- subset(train_valid, train_valid_split == F)
+```
+
+### Logistic Regression
+The code chunk below builds the logistic regression model based on selected features in the training dataset. The feature 1 to 17 in `use_col` are the selected significant features.
+
+```{r Logistic Regression training}
+lgr_model <- glm(DEP_DELAYED ~ ., data=train[use_col[1:17]], family=binomial)
+```
+
+### Classification Tree
+
+Due to the limited computational resources, we manually searched for the best ```cp``` value for the classification tree based on AUC, instead of using grid search with cross validation.
+
+From the performances below, we can see that the best value for ```cp``` is 0.00001. Then we build the classification tree with the best value. 
+
+  cp value      | AUC on validation set
+  -------       | --------------------
+  0.00005       | 0.6930096
+  0.00001       | 0.709647
+  0.000001      | 0.6878494
+
+```{r build 10 classification tree with the best tuned cp}
+southwestTree = rpart(DEP_DELAYED ~ ., data=train[use_col], 
+                      control=rpart.control(cp=0.00001))
+```
+
+## Model Evaluation and Selection
+
+```{r echo=F}
+calc_roc = function(result, groudtruth, to_plot=FALSE){
+  pred = prediction(result, groudtruth)
+  perf = performance(pred, "tpr", "fpr")
+  auc = performance(pred, "auc")
+  if(to_plot){plot(perf, colorsize = T, print.cutoffs.at = seq(0.05,0.20,0.025), text.adj=c(1,1.7))}
+  else{return(auc@y.values[[1]])}
+}
+```
+
+For the baseline model, we classify all data points in the validation set to be 0, the majority class.
+
+```{r echo=F}
+valid_baseline_result = seq(from=0,to=0,length.out = dim(valid)[1])
+valid_baseline_score = calc_roc(valid_baseline_result, valid$DEP_DELAYED)
+valid_log_reg_result <- predict(lgr_model, newdata=valid[use_col[1:17]], 
+                                type="response")
+valid_log_reg_score = calc_roc(valid_log_reg_result, valid$DEP_DELAYED)
+valid_tree_result <- predict(southwestTree, newdata=valid[use_col], 
+                             type="prob")[,2]
+valid_tree_score = calc_roc(valid_tree_result, valid$DEP_DELAYED)
+
+valid_perf_table = data.frame(
+        model=c('Baseline','Logistic Regression','Classification Tree'),
+        score=c(valid_baseline_score,valid_log_reg_score, valid_tree_score))
+valid_perf_table
+```
+
+As logistic regression performs better on the validation set and requires much less computational resources to train and predict on new data, we select logistic regression as our final model.
+
+## Final Model Building and Testing
+
+We use the combined train-validation set to build all significant features in the previous Logistic Regression model and train a new one as the final model on the combined set. 
+
+```{r echo=F}
+southwest = backup
+rm(valid, southwestTree)
+
+train <- subset(southwest, train_test_split == T)
+test <- subset(southwest, train_test_split == F)
+
+airport_qtiles = get_airport_qtiles(train)
+southwest = left_join(southwest, airport_qtiles, by=c('ORIGIN_AIRPORT'='airport'))
+
+plane_otp = get_plane_otp(train)
+southwest <- left_join(southwest, plane_otp, by="TAIL_NUMBER")
+if(sum(is.na(southwest$plane_otp))>0){southwest[is.na(southwest$plane_otp),]$plane_otp = mean(southwest$plane_otp,na.rm = TRUE)}
+
+flight_otp = get_flight_otp(train)
+southwest <- left_join(southwest, flight_otp, by="FLIGHT_NUMBER")
+if(sum(is.na(southwest$flightnum_otp))>0){southwest[is.na(southwest$flightnum_otp),]$flightnum_otp = mean(southwest$flightnum_otp,na.rm = TRUE)}
+
+graph_df = get_graph_features(train)
+southwest = merge_graph_features(graph_df, southwest)
+
+month_origin_weather_delay_mean = get_mean_delay(train, c('MONTH','ORIGIN_AIRPORT'),'WEATHER_DELAY')
+
+southwest = left_join (southwest, month_origin_weather_delay_mean, by=c('MONTH','ORIGIN_AIRPORT'))
+origin_system_delay_mean = get_mean_delay(train, c('ORIGIN_AIRPORT'),'AIR_SYSTEM_DELAY')
+southwest = left_join (southwest, origin_system_delay_mean, by=c('ORIGIN_AIRPORT'))
+
+flight_date <- paste(southwest$MONTH,southwest$DAY, sep='-')
+southwest$IS_HOLIDAY = as.factor((flight_date %in% holidays)*1)
+
+southwest$is_weekend =  as.factor(sapply(southwest$DAY_OF_WEEK, function(x){return((x==6)|(x==7))}))
+
+origin_security_delay_mean = get_mean_delay(train, c('ORIGIN_AIRPORT'),'SECURITY_DELAY')
+southwest = left_join (southwest, origin_security_delay_mean, by=c('ORIGIN_AIRPORT'))
+
+train <- subset(southwest, train_test_split == T)
+test <- subset(southwest, train_test_split == F)
+```
+
+```{r echo=F}
+lgr_model <- glm(DEP_DELAYED ~ ., data=train[use_col[1:17]], family=binomial)
+test_log_reg_result <- predict(lgr_model, 
+                               newdata=test[use_col[1:17]], type="response")
+test_log_reg_score = calc_roc(test_log_reg_result, test$DEP_DELAYED)
+sprintf("Logistic Regression AUC on test data: %s", round(test_log_reg_score,4))
+
+```
+
+Below shows the Receiver Operating Curve of the model performance on test data. We use a threshold range of 0.05 to 0.20 with a step 0.025. From the ROC, we observe that the increase in the False Positive Rate gives a lower increase in the True Positive Rate. As such, the optimal threshold we choose is 0.15. With the threshold, we obtain the confusion matrix (left table) and other performance metrics of our model (right table).
+
+```{r echo=F,fig.height=3, fig.width=6, fig.align='center'}
+par(mar = c(4,4,0.5,2))
+calc_roc(test_log_reg_result, test$DEP_DELAYED, to_plot=TRUE)
+```
+
+```{r echo=F, results = 'asis', warning=F}
+threshold_015_pred = as.factor(test_log_reg_result>0.15)
+cm = confusionMatrix(data=threshold_015_pred, reference=as.factor(test$DEP_DELAYED==1),positive='TRUE',mode='prec_recall')
+cm_table = data.frame(pred_pos=c(cm$table[4],cm$table[2]),pred_neg=c(cm$table[3],cm$table[1]))
+rownames(cm_table) = c('actual_pos','actual_neg')
+
+perf_table = data.frame(score=c(cm$byClass[5],cm$byClass[6],cm$byClass[7]))
+
+t1 <- kable(cm_table, format = 'latex')
+t2 <- kable(perf_table, format = 'latex')
+cat(c("\\begin{table}[h] \\centering ", 
+      t1,
+    "\\hspace{1cm} \\centering ",
+      t2,
+    "\\end{table}"))  
+```
+
+# Discussion, Limitations and Future Extension
+
+## Business Values to Southwest Airlines
+
+Using the classification model built in Section 5.5, Southwest Airlines can predict which of the future scheduled flights are likely to face delays of more than 15 minutes. We believe that Southwest can apply the output of this model to their business operations planning in the following ways:
+
+  1) Southwest can use the prediction output to **better manage customer expectations of delays**, such as by informing passengers ahead of time e.g. having a disclaimer/warning that is displayed to passengers at the time of flight browsing/booking, stating that a particular flight may be susceptible to delays. A management of expectations could help to **reduce dissatisfaction levels** in passengers as such delays will not come as an unpleasant surprise to them, and passengers may have already made plans taking into account the likelihood of delays, thus reducing the disutility they experience. This ultimately helps the company **reduce risks of unhappy customers and damages to its reputation** as a reliable carrier.
+
+  2) Prediction of flights more predisposed to delays also allows Southwest to be **more proactive** and pay more attention to such flights and **devise strategies to alleviate delay risks**. This includes possible incentive schemes to encourage earlier check-ins for passengers, or to schedule more buffer time for preflight activities to ensure internal factors do not contribute to delays. Undeniably, there will still be some external factors that are not within the control of the airline that might cause delays. However, by ensuring internal processes are in place, the airline can ensure that delays are not exacerbated.
+
+## Business Values to Airline Industry
+
+The predictive model can serve as a proof-of-concept for other airlines too. Such prediction models can be used for **better financial planning and forecasting**, especially with regulatory requirements that provision passengers with a right to compensation for different severity of delays, or if the airline has such compensation policies as well. Thus by predicting likely delays, the company can **better estimate compensation amounts** that are expected to be paid out.
+
+## Limitation
+
+One limitation of the current analysis is that the 2015 data is slightly outdated and it would be more relevant to perform the analysis against more recent data. Secondly, there are some inadequacies in the data, as the dataset is only limited to 2015 data. As such, some of the flight statistics features (e.g. on-time performance) were engineered on training data records. Ideally, these flight statistics should be calculated based on historical data and validated/tested against a designated "future" point-in-time (e.g. use 2010-2014 data to predict delays in 2015). 
+
+Lastly, the final predictive model’s performance is still not excellent with the F1-score less than 0.5. The high recall is at the expense of a low precision, implying that there may be many false positives in the model predictions. This might cause an overestimation of compensation amounts (as in the aforementioned use-case of financial planning). Depending on the costs incurred to reduce risk of delays for flights with predicted delays compared to the costs of managing non-predicted delays, low precision may be a concern if the costs for the former is larger than the latter. 
+
+## Future Extension
+
+Understanding the potential risk of our model with high recall but low precision, One way to overcome this could be to **use this initial model as an early indicator of flights at risk of delays**. Subsequently, a separate model with more features and points of information could be developed that can serve as a re-assessor as to the likelihood of a delay when more information is available closer to the day of the scheduled flight (e.g. weather, passenger demographics, etc.).
+
+Other future extensions of this predictive analysis could be to **develop a regression model to predict departure delay in minutes**. This could provide more useful information to airlines especially in forecasting flight delay compensation, since delay compensation policies often involve different tiers depending on severity of delay.
+
+# Conclusion
+
+In summary, through data exploration, we found that flights from busy airports might be more susceptible to delays and that the month in which a flight happens contributes to the likelihood of delays (be it due to seasonality or peak holiday periods). With this knowledge, a predictive model with high recall was created to predict which flights were more likely to be delayed. This can serve as a planning tool for airlines to better pre-empt the occurrence of a delay and thus be able to better manage customer expectations, put in place measures to reduce likelihood or severity of delay, or budget for required compensation to affected passengers.
+
+\newpage
+
+# References
+
+Airlines for America (2020). U.S. Passenger Carrier Delay Cos - Airlines For America. Retrieved November 2, 2020, from https://www.airlines.org/dataset/per-minute-cost-of-delays-to-u-s-airlines/
+
+Bureau of Transportation Statistics (2017, December 12). 2015 U.S.-Based Airline Traffic Data. Bureau of Transportation Statistics. Retrieved November 2, 2020, from https://www.bts.gov/newsroom/2015-us-based-airline-traffic-data
+
+CAPA (2010, November 11). Late flights cost US economy USD33 billion. CAPA. Retrieved November 2, 2020, from https://centreforaviation.com/analysis/reports/the-cost-of-delays-late-flights-cost-us-economy-usd33-billion-39215
+
+IBISWorld (n.d.). Domestic Airlines in the US - Market Size. Retrieved November 2, 2020, from https://www.ibisworld.com/industry-statistics/market-size/domestic-airlines-united-states/
